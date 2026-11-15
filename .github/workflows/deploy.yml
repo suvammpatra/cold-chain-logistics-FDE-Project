@@ -26,4 +26,7 @@ jobs:
             cd /home/ubuntu/cold-chain-logistics-FDE-Project
             git pull origin main
             source venv/bin/activate
+            sudo install -m 0644 deploy/streamlit.service /etc/systemd/system/streamlit.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable streamlit
             sudo systemctl restart streamlit

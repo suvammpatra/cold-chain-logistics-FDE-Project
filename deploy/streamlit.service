@@ -1,0 +1,15 @@
+[Unit]
+Description=Cold Chain Logistics Streamlit application
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/cold-chain-logistics-FDE-Project
+ExecStart=/home/ubuntu/cold-chain-logistics-FDE-Project/venv/bin/streamlit run src/ui.py --server.address=0.0.0.0 --server.port=8501
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
