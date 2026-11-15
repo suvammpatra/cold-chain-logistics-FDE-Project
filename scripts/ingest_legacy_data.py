@@ -1,66 +1,118 @@
-from pathlib import Path
+"""Load the raw logistics CSV into the legacy-style table dbo.TBL_SC_FLEET_HIST_RAW.
+
+Usage:
+    python scripts/ingest_legacy_data.py --target local --dry-run   # show plan, write nothing
+    python scripts/ingest_legacy_data.py --target local             # create table + load
+    python scripts/ingest_legacy_data.py --target aws               # needs the SSH tunnel open
+
+Safety:
+  * The table is NEVER dropped or replaced.
+  * If the table already exists the script stops without writing, unless
+    --append is given (which adds rows on top of the existing ones).
+  * The whole load runs in one transaction: on any error nothing is committed.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+
 import pandas as pd
-import urllib
-import os
-from sqlalchemy import create_engine
-from dotenv import load_dotenv
+from sqlalchemy import inspect, text
 
-# __file__ is 'experiment/phase-0/ingest_legacy_data.py'
-script_dir = Path(__file__).resolve().parent # points to experiment/phase-0
-project_root = script_dir.parents[0] # climbs up 1 levels to project root
+from db_config import PROJECT_ROOT, TARGETS, ConfigError, get_engine, get_target, tunnel_hint
 
-load_dotenv(project_root / ".env")
+DATA_PATH = PROJECT_ROOT / "data" / "raw" / "dynamic_supply_chain_logistics_dataset.csv"
+TABLE_NAME = "TBL_SC_FLEET_HIST_RAW"
+SCHEMA = "dbo"
 
-data_path = project_root / "data" / "raw" / "dynamic_supply_chain_logistics_dataset.csv"
-
-db_host = os.getenv("SQL_SERVER_HOST", "localhost")
-db_port = os.getenv("SQL_SERVER_PORT", "1433")
-db_user = os.getenv("SQL_ADMIN_USER")
-db_password = os.getenv("SQL_ADMIN_PASSWORD")
-
-# 1. Load the raw dataset
-print(f"Loading CSV from {data_path}...")
-df = pd.read_csv(data_path)
-
-# 2. Map clean columns to a messy 2000s legacy enterprise schema
-legacy_mapping = {
-    'timestamp': 'TS_UTC',
-    'vehicle_gps_latitude': 'V_LAT',
-    'vehicle_gps_longitude': 'V_LON',
-    'iot_temperature': 'IOT_TEMP_VAL_C',
-    'cargo_condition_status': 'CGO_COND_CD',
-    'risk_classification': 'RISK_CLS_TXT',
-    'delay_probability': 'DELAY_PROB_DEC',
-    'port_congestion_level': 'PRT_CNG_LVL',
-    'route_risk_level': 'RT_RSK_IDX'
+# Map clean columns to a messy 2000s legacy enterprise schema
+LEGACY_MAPPING = {
+    "timestamp": "TS_UTC",
+    "vehicle_gps_latitude": "V_LAT",
+    "vehicle_gps_longitude": "V_LON",
+    "iot_temperature": "IOT_TEMP_VAL_C",
+    "cargo_condition_status": "CGO_COND_CD",
+    "risk_classification": "RISK_CLS_TXT",
+    "delay_probability": "DELAY_PROB_DEC",
+    "port_congestion_level": "PRT_CNG_LVL",
+    "route_risk_level": "RT_RSK_IDX",
 }
 
-# Keep only the columns we mapped for this demo and rename them
-df_legacy = df[list(legacy_mapping.keys())].rename(columns=legacy_mapping)
 
-# Add a fake ingestion flag to make it look like an automated legacy system
-df_legacy['SYS_INGEST_FLAG'] = 'Y'
+def build_legacy_frame() -> pd.DataFrame:
+    print(f"Loading CSV from {DATA_PATH}...")
+    df = pd.read_csv(DATA_PATH)
+    df_legacy = df[list(LEGACY_MAPPING.keys())].rename(columns=LEGACY_MAPPING)
+    # Fake ingestion flag to make it look like an automated legacy system
+    df_legacy["SYS_INGEST_FLAG"] = "Y"
+    print(f"Prepared {len(df_legacy)} rows x {len(df_legacy.columns)} columns")
+    return df_legacy
 
-# 3. Connect to Docker MSSQL Server
-print("Connecting to legacy MSSQL Database...")
-# Use the pyodbc driver. (Ensure you have ODBC Driver 17 or 18 for SQL Server installed on your OS)
-connection_string = (
-        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-        f"SERVER={db_host},{db_port};"
-        f"DATABASE=master;"
-        f"UID={db_user};"
-        f"PWD={db_password};"
-        f"Encrypt=no;"
-        f"TrustServerCertificate=yes;"
-    )
 
-params = urllib.parse.quote_plus(connection_string)
+def count_rows(conn) -> int:
+    return conn.execute(text(f"SELECT COUNT(*) FROM {SCHEMA}.{TABLE_NAME}")).scalar_one()
 
-engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
 
-# 4. Ingest data into the messy table name
-table_name = 'TBL_SC_FLEET_HIST_RAW'
-print(f"Ingesting into {table_name}. This may take a minute...")
-df_legacy.to_sql(table_name, engine, if_exists='replace', index=False, schema='dbo')
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--target", choices=TARGETS, help="local or aws (default: DB_TARGET from .env)")
+    parser.add_argument("--append", action="store_true",
+                        help="add rows to an existing table (may create duplicates)")
+    parser.add_argument("--dry-run", action="store_true", help="connect and report, but write nothing")
+    args = parser.parse_args()
 
-print("✅ Legacy data ingestion complete!")
+    try:
+        cfg = get_target(args.target)
+    except ConfigError as exc:
+        print(f"ERROR: {exc}")
+        return 2
+
+    print(f"Target: {cfg.describe()}")
+    if not cfg.port_is_open():
+        print(f"ERROR: nothing is listening on {cfg.host}:{cfg.port}.")
+        if cfg.name == "aws":
+            print(f"Open the SSH tunnel first:\n  {tunnel_hint()}")
+        else:
+            print("Start the container first: docker start legacy-mssql")
+        return 2
+
+    df_legacy = build_legacy_frame()
+    engine = get_engine(cfg, fast_executemany=True)
+
+    with engine.connect() as conn:
+        server = conn.execute(text("SELECT @@SERVERNAME")).scalar_one()
+        current_db = conn.execute(text("SELECT DB_NAME()")).scalar_one()
+        print(f"Connected to server '{server}', database '{current_db}'")
+        if current_db != cfg.database:
+            print(f"ERROR: expected database '{cfg.database}' but connected to '{current_db}'.")
+            return 2
+        exists = inspect(conn).has_table(TABLE_NAME, schema=SCHEMA)
+        before = count_rows(conn) if exists else 0
+
+    if exists and not args.append:
+        print(f"{SCHEMA}.{TABLE_NAME} already exists with {before} rows. Nothing written.")
+        print("Existing data is preserved. Use --append only if you really want to add rows on top.")
+        return 0
+
+    action = "append to" if exists else "create"
+    if args.dry_run:
+        print(f"[dry-run] Would {action} {SCHEMA}.{TABLE_NAME} "
+              f"({before} existing rows + {len(df_legacy)} new). Nothing written.")
+        return 0
+
+    print(f"Ingesting into {SCHEMA}.{TABLE_NAME} ({action}). This may take a minute...")
+    with engine.begin() as conn:  # single transaction: commit on success, rollback on error
+        df_legacy.to_sql(
+            TABLE_NAME, conn, schema=SCHEMA, index=False,
+            if_exists="append" if exists else "fail",  # never "replace"
+            chunksize=1000,
+        )
+        after = count_rows(conn)
+
+    print(f"Done. {SCHEMA}.{TABLE_NAME}: {before} rows before, {after} rows after "
+          f"on {cfg.name.upper()} ({cfg.host}:{cfg.port}/{cfg.database}).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
